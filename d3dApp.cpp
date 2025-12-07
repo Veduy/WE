@@ -368,12 +368,19 @@ void D3D12::Update(const GameTimer& gt)
         }
     }
 
+    // 반사된 해골의 월드 행렬을 갱신
+    XMMATRIX Skullworld = XMLoadFloat4x4(&mSkullRitem->World);
+    XMVECTOR mirrorPlane = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f); // z=0 평면
+    XMMATRIX R = XMMatrixReflect(mirrorPlane);
+    XMStoreFloat4x4(&mReflectedSkullRitem->World, Skullworld * R);
+    mReflectedSkullRitem->NumFramesDirty = NUM_FRAME_RESOURCES;
+
     //AnimateMaterials(gt); 
+    //UpdateWaves(gt);
     UpdateObjectCBs(gt);
     UpdateMaterialCBs(gt);
     UpdateMainPassCBs(gt);
     UpdateReflectedPassCB(gt);
-    //UpdateWaves(gt);
 }
 
 void D3D12::Draw(const GameTimer& gt)
@@ -1111,15 +1118,15 @@ void D3D12::BuildPSOs()
     // PSO for transparent objects.
     D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = opaquePsoDesc;
     D3D12_RENDER_TARGET_BLEND_DESC transparencyBlendDesc;
-    transparencyBlendDesc.LogicOpEnable = false;
-    transparencyBlendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
     transparencyBlendDesc.BlendEnable = true;
-    transparencyBlendDesc.BlendOp = D3D12_BLEND_OP_ADD;
-    transparencyBlendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    transparencyBlendDesc.LogicOpEnable = false;
     transparencyBlendDesc.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    transparencyBlendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
     transparencyBlendDesc.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    transparencyBlendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    transparencyBlendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
     transparencyBlendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    transparencyBlendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    transparencyBlendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
     transparencyBlendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
     transparentPsoDesc.BlendState.RenderTarget[0] = transparencyBlendDesc;
@@ -1132,7 +1139,7 @@ void D3D12::BuildPSOs()
     D3D12_DEPTH_STENCIL_DESC mirrorDSS;
     mirrorDSS.DepthEnable = true;
     mirrorDSS.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    mirrorDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    mirrorDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     mirrorDSS.StencilEnable = true;
     mirrorDSS.StencilReadMask = 0xff;
     mirrorDSS.StencilWriteMask = 0xff;
@@ -1144,7 +1151,7 @@ void D3D12::BuildPSOs()
 
     // Backface는 Render안할거라 상관없는데, 인자값 안넣으면 오류남.
     mirrorDSS.BackFace = mirrorDSS.FrontFace;
-
+  
     D3D12_GRAPHICS_PIPELINE_STATE_DESC markMirrorsPsoDesc = opaquePsoDesc;
     markMirrorsPsoDesc.BlendState = mirrorBlendState;
     markMirrorsPsoDesc.DepthStencilState = mirrorDSS;
