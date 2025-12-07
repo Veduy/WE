@@ -372,6 +372,7 @@ void D3D12::Update(const GameTimer& gt)
     UpdateObjectCBs(gt);
     UpdateMaterialCBs(gt);
     UpdateMainPassCBs(gt);
+    UpdateReflectedPassCB(gt);
     //UpdateWaves(gt);
 }
 
@@ -410,8 +411,26 @@ void D3D12::Draw(const GameTimer& gt)
     mCommandList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress());
     DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Opaque]);
 
-    /* TODO: Add Others ...*/
+    // Mark Visible mirrors pixels in the stencil buffer with value 1.
+    mCommandList->OMSetStencilRef(1);
+    mCommandList->SetPipelineState(mPSOs["markStencilMirrors"].Get());
+    DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Mirrors]);
 
+    // Draw the reflection into mirror only (only for pixels where stencil buffer is 1)
+    // Must supply different per-pass constant buffer - one with the lights reflected.
+    mCommandList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress() + 1 * passCBByteSize);
+    mCommandList->SetPipelineState(mPSOs["drawStencilReflections"].Get());
+    DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Reflected]);
+
+    // Restor main pass constants and stencil ref.
+    mCommandList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress());
+    mCommandList->OMSetStencilRef(0);
+
+    // Draw mirror with transparency so reflection blends through.
+    mCommandList->SetPipelineState(mPSOs["transparent"].Get());
+    DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Transparent]);
+
+    // State Transition
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
 
     // Close recording commands.
@@ -478,16 +497,18 @@ void D3D12::OnMouseMove(WPARAM btnState, int x, int y)
 
 void D3D12::UpdateCamera(const GameTimer& gt)
 {
-    mEyePos.x = mRadius * sinf(mPhi) * cosf(mTheta);
-    mEyePos.z = mRadius * sinf(mPhi) * sinf(mTheta);
-    mEyePos.y = mRadius * cosf(mPhi);
+	// Convert Spherical to Cartesian coordinates.
+	mEyePos.x = mRadius*sinf(mPhi)*cosf(mTheta);
+	mEyePos.z = mRadius*sinf(mPhi)*sinf(mTheta);
+	mEyePos.y = mRadius*cosf(mPhi);
 
-    XMVECTOR pos = XMVectorSet(mEyePos.x, mEyePos.y, mEyePos.z, 1.0f);
-    XMVECTOR target = XMVectorZero();
-    XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	// Build the view matrix.
+	XMVECTOR pos = XMVectorSet(mEyePos.x, mEyePos.y, mEyePos.z, 1.0f);
+	XMVECTOR target = XMVectorZero();
+	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
-    XMMATRIX view = XMMatrixLookAtLH(pos, target, up);
-    XMStoreFloat4x4(&mView, view);
+	XMMATRIX view = XMMatrixLookAtLH(pos, target, up);
+	XMStoreFloat4x4(&mView, view);
 }
 
 void D3D12::OnKeyboardInput(const GameTimer& gt)
@@ -883,7 +904,23 @@ void D3D12::UpdateWaves(const GameTimer& gt)
 
 void D3D12::UpdateReflectedPassCB(const GameTimer& gt)
 {
+    mReflectedPassCB = mMainPassCB;
 
+    // XY평면
+    XMVECTOR mirrorPlane = XMVectorSet(0.f, 0.f, 1.f, 0.f);
+    // XMMatrixReflect() 평면에 대해 벡터를 반사하는 행렬 반환.
+    XMMATRIX R = XMMatrixReflect(mirrorPlane);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        // 광원 방향을 반사행렬 R로 변환 -> 반사된 광원 방향으로 변환.
+        XMVECTOR lightDir = XMLoadFloat3(&mMainPassCB.Lights[i].Direction);
+        XMVECTOR reflectedLightDir = XMVector3TransformNormal(lightDir, R);
+        XMStoreFloat3(&mReflectedPassCB.Lights[i].Direction, reflectedLightDir);
+    }
+
+    auto currPassCB = mCurrFrameResource->PassCB.get();
+    currPassCB->CopyData(1, mReflectedPassCB);
 }
 
 void D3D12::LoadTextures()
@@ -991,7 +1028,7 @@ void D3D12::BuildShaderAndInputLayout()
     
     mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders/Default.hlsl", nullptr, "VS", "vs_5_0");
     mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders/Default.hlsl", nullptr, "PS", "ps_5_0");
-    //mShaders["alphaTestedPS"] = d3dUtil::CompileShader(L"Shaders/Default.hlsl", alphaTestDefines, "PS", "ps_5_0");
+    mShaders["alphaTestedPS"] = d3dUtil::CompileShader(L"Shaders/Default.hlsl", alphaTestDefines, "PS", "ps_5_0");
 
     mInputLayout =
     {
@@ -1003,6 +1040,7 @@ void D3D12::BuildShaderAndInputLayout()
 
 void D3D12::BuildGeometries()
 {
+    BuildRoomGeometry();
     BuildSkullGeometry();
 }
 
@@ -1069,6 +1107,70 @@ void D3D12::BuildPSOs()
     opaquePsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     opaquePsoDesc.DSVFormat = mDepthStencilFormat;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaquePsoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
+
+    // PSO for transparent objects.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = opaquePsoDesc;
+    D3D12_RENDER_TARGET_BLEND_DESC transparencyBlendDesc;
+    transparencyBlendDesc.LogicOpEnable = false;
+    transparencyBlendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    transparencyBlendDesc.BlendEnable = true;
+    transparencyBlendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    transparencyBlendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    transparencyBlendDesc.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    transparencyBlendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    transparencyBlendDesc.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    transparencyBlendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    transparencyBlendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    transparentPsoDesc.BlendState.RenderTarget[0] = transparencyBlendDesc;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&transparentPsoDesc, IID_PPV_ARGS(&mPSOs["transparent"])));
+
+    // PSO for marking stencil mirrors;
+    CD3DX12_BLEND_DESC mirrorBlendState(D3D12_DEFAULT);
+    mirrorBlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+
+    D3D12_DEPTH_STENCIL_DESC mirrorDSS;
+    mirrorDSS.DepthEnable = true;
+    mirrorDSS.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    mirrorDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    mirrorDSS.StencilEnable = true;
+    mirrorDSS.StencilReadMask = 0xff;
+    mirrorDSS.StencilWriteMask = 0xff;
+
+    mirrorDSS.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    mirrorDSS.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    mirrorDSS.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+    mirrorDSS.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+
+    // Backface는 Render안할거라 상관없는데, 인자값 안넣으면 오류남.
+    mirrorDSS.BackFace = mirrorDSS.FrontFace;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC markMirrorsPsoDesc = opaquePsoDesc;
+    markMirrorsPsoDesc.BlendState = mirrorBlendState;
+    markMirrorsPsoDesc.DepthStencilState = mirrorDSS;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&markMirrorsPsoDesc, IID_PPV_ARGS(&mPSOs["markStencilMirrors"])));
+
+    // PSO for stencil reflections.
+    D3D12_DEPTH_STENCIL_DESC reflectionsDSS;
+    reflectionsDSS.DepthEnable = true;
+    reflectionsDSS.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    reflectionsDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    reflectionsDSS.StencilEnable = true;
+    reflectionsDSS.StencilReadMask = 0xff;
+    reflectionsDSS.StencilWriteMask = 0xff;
+
+    reflectionsDSS.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    reflectionsDSS.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    reflectionsDSS.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    reflectionsDSS.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+
+    reflectionsDSS.BackFace = reflectionsDSS.FrontFace;
+    
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC drawReflectionsPsoDesc = opaquePsoDesc;
+    drawReflectionsPsoDesc.DepthStencilState = reflectionsDSS;
+    drawReflectionsPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    drawReflectionsPsoDesc.RasterizerState.FrontCounterClockwise = true;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&drawReflectionsPsoDesc, IID_PPV_ARGS(&mPSOs["drawStencilReflections"])));
 }
 
 void D3D12::BuildFrameResources()
@@ -1130,10 +1232,39 @@ void D3D12::BuildMaterials()
 
 void D3D12::BuildRenderItems()
 {
+    auto floorRitem = std::make_unique<RenderItem>();
+    floorRitem->World = MathHelper::Identity4x4();
+    floorRitem->TexTransform = MathHelper::Identity4x4();
+    floorRitem->ObjectCBIndex = 0;
+    floorRitem->Mat = mMaterials["checkertile"].get();
+    floorRitem->Geo = mGeometries["roomGeo"].get();
+    floorRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    floorRitem->IndexCount = floorRitem->Geo->DrawArgs["floor"].IndexCount;
+    floorRitem->StartIndexLocation = floorRitem->Geo->DrawArgs["floor"].StartIndexLocation;
+    floorRitem->BaseVertexLocation = floorRitem->Geo->DrawArgs["floor"].BaseVertexLocation;
+    mRitemLayer[(int)RenderLayer::Opaque].push_back(floorRitem.get());
+
+    auto wallsRitem = std::make_unique<RenderItem>();
+    wallsRitem->World = MathHelper::Identity4x4();
+    wallsRitem->TexTransform = MathHelper::Identity4x4();
+    wallsRitem->ObjectCBIndex = 1;
+    wallsRitem->Mat = mMaterials["bricks"].get();
+    wallsRitem->Geo = mGeometries["roomGeo"].get();
+    wallsRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    wallsRitem->IndexCount = wallsRitem->Geo->DrawArgs["wall"].IndexCount;
+    wallsRitem->StartIndexLocation = wallsRitem->Geo->DrawArgs["wall"].StartIndexLocation;
+    wallsRitem->BaseVertexLocation = wallsRitem->Geo->DrawArgs["wall"].BaseVertexLocation;
+    mRitemLayer[(int)RenderLayer::Opaque].push_back(wallsRitem.get());
+
     auto skullRitem = std::make_unique<RenderItem>();
     skullRitem->World = MathHelper::Identity4x4();
+    XMMATRIX S = XMMatrixScaling(0.4f, 0.4f, 0.4f);
+    XMMATRIX R = XMMatrixRotationY(0.5f * MathHelper::Pi);
+    XMMATRIX T = XMMatrixTranslation(0.f, 0.f, -5.f);
+    XMStoreFloat4x4(&skullRitem->World, S*R*T);
+
     skullRitem->TexTransform = MathHelper::Identity4x4();
-    skullRitem->ObjectCBIndex = 0;
+    skullRitem->ObjectCBIndex = 2;
     skullRitem->Mat = mMaterials["skullMat"].get();
     skullRitem->Geo = mGeometries["skullGeo"].get();
     skullRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -1143,7 +1274,31 @@ void D3D12::BuildRenderItems()
     mSkullRitem = skullRitem.get();
     mRitemLayer[(int)RenderLayer::Opaque].push_back(skullRitem.get());
 
+    // 반사된 해골은 다른 월드 matrix를 가질건데, 그래서 반사된 해골만의 renderitem이 필요함.
+    auto reflectedSkullRitem = std::make_unique<RenderItem>();
+    *reflectedSkullRitem = *skullRitem;
+    reflectedSkullRitem->ObjectCBIndex = 3;
+    mReflectedSkullRitem = reflectedSkullRitem.get();
+    mRitemLayer[(int)RenderLayer::Reflected].push_back(reflectedSkullRitem.get());
+
+    auto mirrorRitem = std::make_unique<RenderItem>();
+    mirrorRitem->World = MathHelper::Identity4x4();
+    mirrorRitem->TexTransform = MathHelper::Identity4x4();
+    mirrorRitem->ObjectCBIndex = 4;
+    mirrorRitem->Mat = mMaterials["icemirror"].get();
+    mirrorRitem->Geo = mGeometries["roomGeo"].get();
+    mirrorRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    mirrorRitem->IndexCount = mirrorRitem->Geo->DrawArgs["mirror"].IndexCount;
+    mirrorRitem->StartIndexLocation = mirrorRitem->Geo->DrawArgs["mirror"].StartIndexLocation;
+    mirrorRitem->BaseVertexLocation = mirrorRitem->Geo->DrawArgs["mirror"].BaseVertexLocation;
+    mRitemLayer[(int)RenderLayer::Mirrors].push_back(mirrorRitem.get());
+    mRitemLayer[(int)RenderLayer::Transparent].push_back(mirrorRitem.get());
+
+    mAllRitems.push_back(std::move(floorRitem));
+    mAllRitems.push_back(std::move(wallsRitem));
     mAllRitems.push_back(std::move(skullRitem));   
+    mAllRitems.push_back(std::move(reflectedSkullRitem));
+    mAllRitems.push_back(std::move(mirrorRitem));
 }
 
 void D3D12::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& RenderItems)

@@ -209,7 +209,7 @@ private:
 	std::vector<RenderItem*> mRitemLayer[(int)RenderLayer::Count];
 
 	PassConstants mMainPassCB;
-	PassConstants ReflectedPassCB;
+	PassConstants mReflectedPassCB;
 	UINT PassCbvOffset = 0;
 
 	RenderItem* WavesRenderItem = nullptr;
